@@ -1,6 +1,5 @@
 import os
 import errno
-import json
 import re
 import shutil
 import struct
@@ -16,6 +15,7 @@ from .rstfile import hashfile_rst, RstFile, key_to_hash as key_to_rsthash
 from .tools import (
     write_file_or_remove,
     write_dir_or_remove,
+    json_dumps
 )
 
 logger = logging.getLogger(__name__)
@@ -313,9 +313,9 @@ class Exporter:
                 if not overwrite and converter.converted_paths_exist(self.output, wadfile.path):
                     continue
 
-                data = wadfile.read_data(fwad)
+                data = wad.read_file_data(fwad, wadfile)
                 if data is None:
-                    continue  # should not happen, file redirections have been filtered already
+                    continue
 
                 try:
                     converter.convert(BytesIO(data), self.output, wadfile.path)
@@ -401,8 +401,10 @@ class CdragonRawPatchExporter:
             for path in sorted(new_paths):
                 print(path, file=f)
 
-        logger.info(f"export TFT data files")
+        logger.info("export TFT data files")
         self.export_tft_data()
+        logger.info("export Arena data files")
+        self.export_arena_data()
 
     def export_tft_data(self):
         if self.patch.version != 'main' and self.patch.version < PatchVersion('9.14'):
@@ -411,6 +413,14 @@ class CdragonRawPatchExporter:
         from .tftdata import TftTransformer
         transformer = TftTransformer(os.path.join(self.output, "game"))
         transformer.export(os.path.join(self.output, "cdragon/tft"), langs=None)
+
+    def export_arena_data(self):
+        if self.patch.version != 'main' and self.patch.version < PatchVersion('13.14'):
+            return  # no supported Arena data before 13.14
+        # don't import in module to be able to execute arenadata module
+        from .arenadata import ArenaTransformer
+        transformer = ArenaTransformer(os.path.join(self.output, "game"))
+        transformer.export(os.path.join(self.output, "cdragon/arena"), langs=None)
 
     def _create_exporter(self, patch):
         if patch.version == 'main':
@@ -456,12 +466,13 @@ class CdragonRawPatchExporter:
         # - keep images and skin files
         # - keep .bin files, except 'data/*_skins_*.bin' files
         # - keep .txt files (some contain useful data)
+        # - keep font files
         # - add 'game/' prefix to export path
         def filter_path(path):
             _, ext = os.path.splitext(path)
             if ext == '.bin':
                 return '_skins_' not in path
-            return ext in ('.dds', '.tga', '.tex', '.skn', '.txt', '.stringtable')
+            return ext in ('.dds', '.tga', '.tex', '.skn', '.txt', '.stringtable', '.ttf', '.otf')
 
         for path, wad in exporter.wads.items():
             if path.endswith('.wad.client'):
@@ -645,38 +656,49 @@ class TexConverter(FileConverter):
 
     @staticmethod
     def tex_to_dds(data):
+        # Parse TEX header
         if len(data) < 12 or data[:4] != b'TEX\0':
             raise FileConversionError("invalid TEX file")
         _, width, height, format, has_mipmaps = struct.unpack('<4sHHxBx?', data[:12])
-        dds_flags = 0x01007
-        pixel_format_flags = 0x04
-        rgba_mask = b'\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0'
-        if format == 0x0c:
-            dxt = b'DXT5'
-            dds_flags |= 0x80000
-        elif format == 0x0a:
-            dxt = b'DXT1'
-            dds_flags |= 0x80000
-        elif format == 0x14:
-            dxt = b'\0\0\0\0'
-            dds_flags |= 0x8
-            pixel_format_flags = 0x41
-            rgba_mask = b'\x20\0\0\0\0\0\xff\0\0\xff\0\0\xff\0\0\0\0\0\0\xff'
+
+        if format == 0x0a:  # DXT1
+            ddspf = struct.pack('<LL4s20x', 32, 0x4, b'DXT1')
+        elif format == 0x0c:  # DXT5
+            ddspf = struct.pack('<LL4s20x', 32, 0x4, b'DXT5')
+        elif format == 0x14:  # BGRA8
+            ddspf = struct.pack('<LL4x5L', 32, 0x41, 8*4, 0x00ff0000, 0x0000ff00, 0x000000ff, 0xff000000)
         else:
             raise FileConversionError(f"unsupported TEX format: {format:x}")
+
         if has_mipmaps:
-            # Note: ignore mipmaps, use only the largest image
-            # Assume pixel format with 1 byte per pixel
-            pixels = data[- width * height:]
+            # Note: only convert the largest mipmap
+
+            if format == 0x0a:  # DXT1
+                block_size = 4
+                bytes_per_block = 8
+            elif format == 0x0c:  # DXT5
+                block_size = 4
+                bytes_per_block = 16
+            elif format == 0x14:  # BGRA8
+                block_size = 1
+                bytes_per_block = 4
+
+            # Find mipmap count
+            n = max(width, height)
+            mipmap_count = 0
+            while n > 0:
+                mipmap_count += 1
+                n >>= 1
+
+            block_width = (width + block_size - 1) // block_size
+            block_height = (height + block_size - 1) // block_size
+            mipmap_size = bytes_per_block * block_width * block_height
+            pixels = data[-mipmap_size:]
         else:
             pixels = data[12:]
-        pitch = width * 4 if format == 0x14 else len(pixels)
 
-        # Static parts of the DDS header
-        prefix = b'DDS |\0\0\0'
-        middle = b'\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x20\0\0\0'
-        suffix = b'\0\x10\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0'
-        return prefix + struct.pack('<LLLL', dds_flags, height, width, pitch) + middle + struct.pack('<L', pixel_format_flags) + dxt + rgba_mask + suffix + pixels
+        dds_header = struct.pack('<4s4L56x32sL16x', b'DDS ', 124, 0x1007, height, width, ddspf, 0x1000)
+        return dds_header + pixels
 
 class BinConverter(FileConverter):
     def __init__(self, regex, btype_version=None):
@@ -699,7 +721,7 @@ class BinConverter(FileConverter):
                 binfile = BinFile(output_path, btype_version=self.btype_version)
             except ValueError as e:
                 raise FileConversionError(f"failed to parse bin file: {e}")
-            fout.write(json.dumps(binfile.to_serializable()).encode('ascii'))
+            fout.write(json_dumps(binfile.to_serializable()).encode('ascii'))
 
 class SknConverter(FileConverter):
     def __init__(self):
@@ -753,4 +775,4 @@ class RstConverter(FileConverter):
             rst_json["entries"][key] = value
 
         with write_file_or_remove(output_path + '.json', False) as fout:
-            fout.write(json.dumps(rst_json, ensure_ascii=False))
+            fout.write(json_dumps(rst_json, ensure_ascii=False))

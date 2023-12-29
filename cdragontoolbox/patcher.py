@@ -13,14 +13,12 @@ from .storage import (
     PatchVersion,
     get_system_yaml_version,
     get_content_metadata_version,
-    get_exe_version,
 )
 from .tools import (
     BinaryParser,
     write_file_or_remove,
     zstd_decompress,
 )
-from .data import Language
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +115,7 @@ class PatcherManifest:
 
         # offsets to tables (convert to absolute)
         offsets_base = parser.tell()
-        offsets = list(offsets_base + 4*i + v for i, v in enumerate(parser.unpack(f'<6l')))
+        offsets = list(offsets_base + 4*i + v for i, v in enumerate(parser.unpack('<6l')))
 
         parser.seek(offsets[0])
         self.bundles = list(self._parse_table(parser, self._parse_bundle))
@@ -160,23 +158,27 @@ class PatcherManifest:
             yield entry_parser(parser)
             parser.seek(pos + 4)
 
-    @staticmethod
-    def _parse_bundle(parser):
+    @classmethod
+    def _parse_bundle(cls, parser):
         """Parse a bundle entry"""
-        _, n, bundle_id = parser.unpack('<llQ')
-        # skip remaining header part, if any
-        parser.skip(n - 12)
 
-        bundle = PatcherBundle(bundle_id)
-        n, = parser.unpack('<l')
-        for _ in range(n):
-            pos = parser.tell()
-            offset, = parser.unpack('<l')
-            parser.seek(pos + offset)
-            parser.skip(4)  # skip offset table offset
-            compressed_size, uncompressed_size, chunk_id = parser.unpack('<LLQ')
+        def parse_chunklist(parser):
+            fields = cls._parse_field_table(parser, (
+                ('chunk_id', '<Q'),
+                ('compressed_size', '<L'),
+                ('uncompressed_size', '<L'),
+            ))
+            return fields['chunk_id'], fields['compressed_size'], fields['uncompressed_size']
+
+        fields = cls._parse_field_table(parser, (
+            ('bundle_id', '<Q'),
+            ('chunks_offset', 'offset'),
+        ))
+
+        bundle = PatcherBundle(fields['bundle_id'])
+        parser.seek(fields['chunks_offset'])
+        for (chunk_id, compressed_size, uncompressed_size) in cls._parse_table(parser, parse_chunklist):
             bundle.add_chunk(chunk_id, compressed_size, uncompressed_size)
-            parser.seek(pos + 4)
 
         return bundle
 
@@ -193,8 +195,6 @@ class PatcherManifest:
         (name, link, flag_ids, directory_id, filesize, chunk_ids)
         """
         fields = cls._parse_field_table(parser, (
-            None,
-            ('chunks', 'offset'),
             ('file_id', '<Q'),
             ('directory_id', '<Q'),
             ('file_size', '<L'),
@@ -202,7 +202,7 @@ class PatcherManifest:
             ('flags', '<Q'),
             None,
             None,
-            None,
+            ('chunks', 'offset'),
             None,
             ('link', 'str'),
             None,
@@ -228,8 +228,6 @@ class PatcherManifest:
         (name, directory_id, parent_id)
         """
         fields = cls._parse_field_table(parser, (
-            None,
-            None,
             ('directory_id', '<Q'),
             ('parent_id', '<Q'),
             ('name', 'str'),
@@ -243,7 +241,9 @@ class PatcherManifest:
         nfields = len(fields)
         output = {}
         parser.seek(fields_pos)
-        for i, field, offset in zip(range(nfields), fields, parser.unpack(f'<{nfields}H')):
+        parser.skip(2) # vtable size
+        parser.skip(2) # object size
+        for _, field, offset in zip(range(nfields), fields, parser.unpack(f'<{nfields}H')):
             if field is None:
                 continue
             name, fmt = field
@@ -251,15 +251,14 @@ class PatcherManifest:
                 value = None
             else:
                 pos = entry_pos + offset
+                parser.seek(pos)
                 if fmt == 'offset':
-                    value = pos
+                    value = pos + parser.unpack('<l')[0]
                 elif fmt == 'str':
-                    parser.seek(pos)
                     value = parser.unpack('<l')[0]
                     parser.seek(pos + value)
                     value = parser.unpack_string()
                 else:
-                    parser.seek(pos)
                     value = parser.unpack(fmt)[0]
             output[name] = value
         return output
@@ -292,10 +291,14 @@ class PatcherStorage(Storage):
     `channels/.../files/` contains symlinks to them.
     This can be disabled by setting the `use_extract_symlinks` option to false.
 
+    Sometimes, HTTPS requests to clientconfig.rpg.riotgames.com are denied.
+    If `clientconfig_data` is set, the provided file (if available) or URL is used.
+
     Configuration options:
       patchline -- the patchline name (`live` or `pbe`)
       region -- region from which use configuration
       use_extract_symlinks -- if false, disable use of symlinks for extracted files
+      clientconfig_data -- file or URL to use as 'clientconfig.rpg.riotgames.com' data
 
     """
 
@@ -310,12 +313,15 @@ class PatcherStorage(Storage):
         super().__init__(path, self.URL_BASE)
         self.patchline = patchline
         self.use_extract_symlinks = True
+        self.clientconfig_data = None
 
     @classmethod
     def from_conf_data(cls, conf):
         storage = cls(conf['path'], conf.get('patchline', cls.DEFAULT_PATCHLINE))
         if conf.get('use_extract_symlinks') is False:
             storage.use_extract_symlinks = False
+        if 'clientconfig_data' in conf:
+            storage.clientconfig_data = conf['clientconfig_data']
         return storage
 
     def base_release_path(self):
@@ -372,9 +378,15 @@ class PatcherStorage(Storage):
             print(f"{timestamp}", file=f)
 
     def get_latest_client_manifest(self):
-        r = self.s.get(f"https://clientconfig.rpg.riotgames.com/api/v1/config/public?namespace=keystone.products.league_of_legends.patchlines")
-        r.raise_for_status()
-        data = r.json()
+        url_or_path = self.clientconfig_data
+        if url_or_path and not url_or_path.startswith('http://') and not url_or_path.startswith('https://') and os.path.exists(url_or_path):
+            with open(url_or_path) as f:
+                data = json.load(f)
+        else:
+            url = url_or_path or "https://clientconfig.rpg.riotgames.com/api/v1/config/public?namespace=keystone.products.league_of_legends.patchlines"
+            r = self.s.get(url)
+            r.raise_for_status()
+            data = r.json()
         region = 'PBE' if self.patchline == 'pbe' else self.CLIENT_LIVE_REGION
         for config in data[f"keystone.products.league_of_legends.patchlines.{self.patchline}"]["platforms"]["win"]["configurations"]:
             if config['id'] == region:
@@ -635,133 +647,4 @@ class PatcherPatchElement(PatchElement):
     def paths(self, langs=True):
         for f in self.elem.manif.filter_files(langs=langs):
             yield (self.elem.extract_path(f), f.name.lower())
-
-
-class MultiPatcherStorage(Storage):
-    """
-    PatcherStorage merging multiple channels
-
-    This storage always announce a single element which merge the latest
-    elements of each individual sub-storage.
-
-    Configuration options:
-      channels -- the channel names
-
-    """
-
-    storage_type = 'multipatcher'
-
-    DEFAULT_CHANNELS = tuple(f"live-{x}-win" for x in "br eune euw jp kr la1 la2 na oc1 ru tr".split())
-
-    def __init__(self, path, channels=DEFAULT_CHANNELS):
-        if not channels:
-            raise ValueError("no channels")
-        super().__init__(path, PatcherStorage.URL_BASE)
-        self.substorages = [PatcherStorage(path, channel) for channel in channels]
-
-    @classmethod
-    def from_conf_data(cls, conf):
-        return cls(conf['path'], conf.get('channels', cls.DEFAULT_CHANNELS))
-
-    def patch_elements(self, stored=False):
-        if not stored:
-            # add latest releases to the storage, if any
-            self.fetch_latest_update()
-
-        # Peek next element for each storage.
-        # Skip duplicate manifests, order by patch version then timestamp.
-        manifest_urls = set()
-
-        class Peeker:
-            def __init__(self, it):
-                self.it = it
-                self.element = self.version = self.date = None
-
-            def peek(self):
-                while self.element is None:
-                    try:
-                        element = next(self.it)
-                    except StopIteration:
-                        return False
-                    if element.manif_url in manifest_urls:
-                        continue  # manifest already processed
-                    manifest_urls.add(element.manif_url)
-                    self.element = element
-                    self.version = element.patch_version()
-                    self.date = element.release.data["timestamp"]
-                    break
-                return True
-
-            def consume(self):
-                assert self.element is not None
-                self.element = self.version = self.date = None
-
-        peekers = [Peeker((e for r in substorage.iter_releases() for e in r.elements())) for substorage in self.substorages]
-        current_elements = {}  # {name: [(date, elem)]}
-        current_version = {}  # {name: version}
-
-        while True:
-            best_peeker = None
-            for peeker in peekers:
-                if not peeker.peek():
-                    continue
-                if best_peeker is None or (peeker.version, peeker.date) > (best_peeker.version, best_peeker.date):
-                    best_peeker = peeker
-            if best_peeker is None:
-                break  # exhausted
-            name = best_peeker.element.name
-
-            if best_peeker.version != current_version.get(name):
-                # new version: yield the previous one
-                if name in current_elements:
-                    yield MultiPatcherPatchElement(name, best_peeker.version, current_elements[name])
-                current_elements[name] = []
-                current_version[name] = best_peeker.version
-            current_elements[name].append((best_peeker.date, best_peeker.element))
-            best_peeker.consume()
-
-        # don't forget the last versions
-        for name, elems in current_elements.items():
-            if elems:
-                yield MultiPatcherPatchElement(name, current_version[name], elems)
-
-    def fetch_latest_update(self):
-        """Fetch the latest release from the CDN, for each substorage"""
-        for substorage in self.substorages:
-            substorage.fetch_latest_update()
-
-
-class MultiPatcherPatchElement(PatchElement):
-    """Patch element from a multi-patcher storage"""
-
-    def __init__(self, name, version, dated_elements):
-        super().__init__(name, version)
-        self.elements = [e for d, e in sorted(dated_elements, key=lambda o: o[0], reverse=True)]
-        files = {}  # {name: (elem, f)}
-        for elem in self.elements:
-            for fname, f in elem.manif.files.items():
-                if fname not in files:
-                    files[fname] = (elem, f)
-        self.files = files.values()
-
-    def download(self, langs=True):
-        for elem in self.elements:
-            # There must not be significant overhead for extracting everything,
-            # including "duplicate" files. Even for extract, since symlinks are
-            # used, it does not cost much. Moreoever, completely identical
-            # elements (same manifest) have already been filtered out.
-            elem.download_bundles(langs=langs)
-            elem.extract(langs=langs)
-
-    def fspaths(self, langs=True):
-        pred = PatcherFile.langs_predicate(langs)
-        return (elem.extract_path(f) for elem, f in self.files if pred(f))
-
-    def relpaths(self, langs=True):
-        pred = PatcherFile.langs_predicate(langs)
-        return (f.name.lower() for elem, f in self.files if pred(f))
-
-    def paths(self, langs=True):
-        pred = PatcherFile.langs_predicate(langs)
-        return ((elem.extract_path(f), f.name.lower()) for elem, f in self.files if pred(f))
 

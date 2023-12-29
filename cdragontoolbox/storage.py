@@ -4,7 +4,7 @@ import itertools
 import json
 import glob
 from contextlib import contextmanager
-from typing import List, Tuple, Union, Optional, Generator, Iterable
+from typing import List, Tuple, Union, Optional, Generator
 import logging
 import requests
 import hachoir.parser
@@ -153,21 +153,12 @@ def storage_conf_from_path(path):
         storage_type, storage_path = path.split(':', 1)
         return {'type': storage_type, 'path': storage_path}
     else:
-        raise ValueError(f"invalid storage path: {path}")
+        return {'type': 'patcher', 'path': storage_path}
 
 def guess_storage_conf(path):
     """Try to guess storage configuration from path"""
 
-    if os.path.isdir(os.path.join(path, 'solutions')):
-        # don't accept game installation directories
-        if glob.glob(os.path.join(path, 'solutions/lol_game_client_sln/releases/releases_*')):
-            return None
-        conf = {'type': 'rads', 'path': path}
-        basename = os.path.basename(path)
-        if basename in ('RADS.pbe', 'RADS.kr'):
-            conf['cdn'] = basename.split('.')[-1]
-        return conf
-    elif os.path.isdir(os.path.join(path, 'channels')):
+    if os.path.isdir(os.path.join(path, 'channels')):
         return {'type': 'patcher', 'path': path}
     return None
 
@@ -435,8 +426,7 @@ def get_system_yaml_version(path) -> str:
             m = re.match(r"""^ *(?:game-|)branch: .*["'/]([0-9.]+)["']?$""", line)
             if m:
                 return m.group(1)
-        else:
-            return None
+        return None
 
 
 def get_exe_version(path) -> str:

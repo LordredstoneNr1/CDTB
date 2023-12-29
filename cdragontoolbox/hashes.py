@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import datetime
 import glob
 import itertools
 import signal
@@ -9,11 +10,44 @@ import json
 import struct
 import logging
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Dict
+import requests
 from xxhash import xxh64_intdigest
 from .data import REGIONS, Language
+from .tools import write_file_or_remove
 
 logger = logging.getLogger(__name__)
+
+
+def _default_hash_dir():
+    """
+    Hash directory is search for in this order
+
+    - `$CDRAGONTOOLBOX_HASHES_DIR` if set
+    - `$CDRAGON_DATA/hashes/lol` if `$CDRAGON_DATA` is set
+    - If one of the following "data" directory exists, use `<dir>/hashes/lol`
+      - `$XDG_DATA_HOME/cdragon`
+      - `$LOCALAPPDATA/cdragon`
+      - `~/.local/share/cdragon` (see `Path.home()` for `~`)
+
+    """
+    def _env_dir(name):
+        value = os.environ.get(name)
+        return Path(value) if value else None
+    if path := _env_dir('CDRAGONTOOLBOX_HASHES_DIR'):
+        return path
+    if path := _env_dir('CDRAGON_DATA'):
+        return path / 'hashes/lol'
+
+    # Always search in XDG_DATA_HOME, even on Windows
+    path = _env_dir('XDG_DATA_HOME')
+    if not path or not path.is_absolute():
+        # Assume LOCALAPPDATA is not set when not on Windows
+        path = _env_dir('LOCALAPPDATA') or Path.home() / ".local/share"
+    return path / 'cdragon/data/hashes/lol'
+
+default_hash_dir = _default_hash_dir()
 
 
 class HashFile:
@@ -26,9 +60,12 @@ class HashFile:
 
     def load(self, force=False) -> Dict[int, str]:
         if force or self.hashes is None:
-            with open(self.filename) as f:
-                hashes = (l.strip().split(' ', 1) for l in f)
-                self.hashes = {int(h, 16): s for h, s in hashes}
+            try:
+                with open(self.filename) as f:
+                    hashes = (l.strip().split(' ', 1) for l in f)
+                    self.hashes = {int(h, 16): s for h, s in hashes}
+            except FileNotFoundError:
+                raise FileNotFoundError(f"Hash file not found; try to run 'fetch-hashes' command: {self.filename}")
         return self.hashes
 
     def save(self):
@@ -36,8 +73,8 @@ class HashFile:
             for h, s in sorted(self.hashes.items(), key=lambda kv: kv[1]):
                 print(self.line_format.format(h, s), file=f)
 
-hashfile_lcu = HashFile(os.path.join(os.path.dirname(__file__), "hashes.lcu.txt"))
-hashfile_game = HashFile(os.path.join(os.path.dirname(__file__), "hashes.game.txt"))
+hashfile_lcu = HashFile(default_hash_dir / "hashes.lcu.txt")
+hashfile_game = HashFile(default_hash_dir / "hashes.game.txt")
 
 def default_hashfile(path):
     """Return the default hashfile for the given WAD file"""
@@ -47,6 +84,30 @@ def default_hashfile(path):
         return hashfile_lcu
     else:
         raise ValueError(f"no default hashes for WAD file '{path}'")
+
+def update_default_hashfile(basename):
+    """Update a hashfile if a new version is available for download"""
+
+    path = default_hash_dir / basename
+    url = f"https://raw.communitydragon.org/data/hashes/lol/{basename}"
+
+    try:
+        last_time = path.stat().st_mtime
+        # CloudFlare does not support 'if-modified-since'
+        # We have to send a separate HEAD
+        r = requests.head(url)
+        r.raise_for_status()
+        last_modified = datetime.datetime.strptime(r.headers['last-modified'], '%a, %d %b %Y %H:%M:%S GMT').replace(tzinfo=datetime.timezone.utc)
+        if last_time >= last_modified.timestamp():
+            return  # up to date
+    except FileNotFoundError:
+        pass  # Never downloaded
+
+    logger.debug(f"update hash file from {url}")
+    r = requests.get(url)
+    r.raise_for_status()
+    with write_file_or_remove(path) as f:
+        f.write(r.content)
 
 
 def build_wordlist(paths):
@@ -80,7 +141,7 @@ def sigint_callback(callback):
     try:
         yield
     finally:
-        handler_back = signal.signal(signal.SIGINT, previous_handler)
+        _handler_back = signal.signal(signal.SIGINT, previous_handler)
 
 def progress_iterate(sequence, formatter=None):
     """Iterate over sequence, display progress on SIGINT"""
@@ -222,7 +283,7 @@ class HashGuesser:
         words = list(words) # Ensure words is a list
         format_part = "{sep}%%s" * (nnew-1)
         format_part = f"%s%%s{format_part}%s"
-        re_extract = re.compile(f"([^/_.-]+)(?=((?:[-_][^/_.-]+){{{nold-1}}})[^/]*\.[^/]+$)")
+        re_extract = re.compile(rf"([^/_.-]+)(?=((?:[-_][^/_.-]+){{{nold-1}}})[^/]*\.[^/]+$)")
         temp_formats = set()
         for path in paths:
             for m in re_extract.finditer(path):
@@ -267,7 +328,7 @@ class HashGuesser:
         formats = set()
         for path in paths:
             for m in re_extract.finditer(path):
-                formats.add(f'%s%s%s' % (path[:m.start()], fmt, path[m.end():]))
+                formats.add('%s%s%s' % (path[:m.start()], fmt, path[m.end():]))
 
         nrange = range(nmax)
         logger.debug(f"substitute numbers: {len(formats)} formats, nmax = {nmax}")
@@ -330,7 +391,7 @@ class LcuHashGuesser(HashGuesser):
         regex = re.compile(r'^plugins/([^/]+)/[^/]+/[^/]+/')
         region_lang_list = [(r, l) for r in regions for l in langs]
         known = list(self.known.values())
-        logger.debug(f"substitute region and lang")
+        logger.debug("substitute region and lang")
         for region_lang in progress_iterator(region_lang_list, lambda rl: f"{rl[0]}/{rl[1]}"):
             replacement = r'plugins/\1/%s/%s/' % region_lang
             self.check_iter(regex.sub(replacement, p) for p in known)
@@ -606,6 +667,8 @@ class GameHashGuesser(HashGuesser):
         re_suffix = re.compile(r'^(.*?)(\.[^.]+)?(\.[^.]+)$')
         for p in self.known.values():
             m = re_suffix.search(p)
+            if not m:
+                continue
             prefix, suffix, ext = m.groups()
             if suffix:
                 suffixes.add(suffix)
@@ -644,7 +707,7 @@ class GameHashGuesser(HashGuesser):
                 group_skin_ids.extend(d['id'] for d in skin_data['chromas'])
             char_to_skin_groups.setdefault(char_name, []).append([int(i) % 1000 for i in group_skin_ids])
 
-        logger.debug(f"find skin groups .bin files using chroma groups")
+        logger.debug("find skin groups .bin files using chroma groups")
         for char, groups in progress_iterator(char_to_skin_groups.items(), lambda v: v[0]):
             str_groups = [[f"_skins_skin{i}" for i in group] for group in groups] + [["_skins_root"]]
             for n in range(len(str_groups)):
@@ -670,7 +733,7 @@ class GameHashGuesser(HashGuesser):
             char_to_skins.setdefault(char, {0}).add(nskin)
 
         # generate all combinations
-        logger.debug(f"find skin groups .bin files")
+        logger.debug("find skin groups .bin files")
         for char, skins in progress_iterator(char_to_skins.items(), lambda v: v[0]):
             # note: skins are in lexicographic order: skin11 is before skin2
             str_skins = sorted(f"_skins_skin{i}" for i in skins)
@@ -741,13 +804,15 @@ class GameHashGuesser(HashGuesser):
                 if wadfile.type == 2:
                     continue # softlink; contains no actual content
                 if wadfile.ext in ('dds', 'jpg', 'png', 'tga', 'ttf', 'otf', 'ogg', 'webm', 'anm',
-                                   'skl', 'skn', 'scb', 'sco', 'troybin', 'luabin', 'luabin64', 'bnk', 'wpk'):
+                                   'skl', 'skn', 'scb', 'sco', 'troybin', 'bnk', 'wpk', 'tex'):
                     continue # don't grep filetypes known to not contain full paths
 
-                data = wadfile.read_data(f)
+                data = wad.read_file_data(f, wadfile)
+                if data is None:
+                    continue
                 if wadfile.ext in ('bin', 'inibin'):
                     # bin files: find strings based on prefix, then parse the length
-                    for m in re.finditer(br'(?:ASSETS|DATA|Characters|Shaders|Maps/MapGeometry|Gameplay)/', data):
+                    for m in re.finditer(br'(?:ASSETS|DATA|Characters|Shaders|Maps/MapGeometry|Gameplay|ClientStates)/', data):
                         i = m.start()
                         n = data[i-2] + (data[i-1] << 8)
                         try:
@@ -766,6 +831,9 @@ class GameHashGuesser(HashGuesser):
                         elif path.startswith('maps'):
                             self.check(f"data/{path}.mapgeo")
                             self.check(f"data/{path}.materials.bin")
+                        elif path.startswith('clientstates'):
+                            self.check(path.rsplit('/', 1)[0])
+                            self.check(path.rsplit('/', 2)[0])
                         else:
                             self.check(path)
                             if path.endswith(".png"):
@@ -805,7 +873,7 @@ class GameHashGuesser(HashGuesser):
 
         # find path-like strings, then try to parse the length
         paths = set()
-        for m in re.finditer(br'(?:ASSETS|Common|DATA|DATA_SOON|DATA_Soon|Gameplay|Global|LEVELS|UX)/[0-9a-zA-Z_. /-]+', data):
+        for m in re.finditer(br'(?:ASSETS|Common|DATA|DATA_SOON|DATA_Soon|Gameplay|Global|LEVELS|Loadouts|UX|UIAutoAtlas)/[0-9a-zA-Z_. /-]+', data):
             path = m.group(0).lower().decode('ascii')
             paths.add(path.replace("data_soon/", "data/"))
             pos = m.start()
